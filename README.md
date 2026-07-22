@@ -25,5 +25,3 @@ mise exec -- deno run --allow-net --allow-env --allow-read bridge.ts react <ts> 
 ```
 
 Set `IGNORE_AUTHOR_IDS` (comma-separated Slack user/bot IDs) to skip messages from those authors — useful for excluding the bot's own messages or other bots sharing the channel.
-
-`bridge.py` is an earlier Python-stdlib-only implementation of the same interface, kept for reference.
