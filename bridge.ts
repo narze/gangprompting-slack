@@ -1,12 +1,15 @@
 #!/usr/bin/env -S deno run --allow-net --allow-env --allow-read
-// Slack gangprompting bridge: read / send / monitor / react over conversations.history + chat.postMessage.
-// Env: SLACK_BOT_TOKEN, SLACK_CHANNEL (defaults loaded from .env next to this script)
-// Usage:
-//   bridge.ts read [--limit N] [--oldest TS]
+// Slack gangprompting bridge: read / send / long-poll / react / thread over the Slack Web API.
+// Env: SLACK_BOT_TOKEN, SLACK_CHANNEL, SLACK_POLL_INTERVAL (defaults loaded from .env next to this script)
+// Usage (every command also takes --channel ID to override SLACK_CHANNEL for one call):
+//   bridge.ts read [--limit N] [--after TS]
 //   bridge.ts send <text> [--thread-ts TS]
-//   bridge.ts monitor [--interval SECONDS]
+//   bridge.ts long-poll --after TS [--timeout SECONDS] [--include-bots]
 //   bridge.ts react <ts> <emoji-name>
-// Each read/monitor line is one JSON object: {id, timestamp, author, author_id, content, thread_ts}
+//   bridge.ts thread <parent-ts>
+// Each message line is one JSON object: {id, timestamp, channel_id, author, author_id, content, thread_ts}.
+// long-poll also prints plain-text lines that start with ">>>": a reminder to start long-poll again
+// before acting on the messages, and the exact command to run next.
 
 const HERE = new URL(".", import.meta.url).pathname;
 
@@ -28,7 +31,14 @@ async function loadEnv() {
 await loadEnv();
 
 const TOKEN = Deno.env.get("SLACK_BOT_TOKEN")!;
-const CHANNEL = Deno.env.get("SLACK_CHANNEL");
+
+// `--channel ID` works on every command: pull it out of the args before dispatch so each
+// command sees only its own options, and so one agent can watch several channels.
+const [cmd, ...rawArgs] = Deno.args;
+const channelFlag = rawArgs.indexOf("--channel");
+const CHANNEL_OVERRIDE = channelFlag >= 0 ? rawArgs[channelFlag + 1] : undefined;
+const rest = channelFlag >= 0 ? rawArgs.filter((_, i) => i !== channelFlag && i !== channelFlag + 1) : rawArgs;
+const CHANNEL = CHANNEL_OVERRIDE ?? Deno.env.get("SLACK_CHANNEL");
 
 const userCache = new Map<string, string>();
 
@@ -69,13 +79,28 @@ const IGNORE_AUTHOR_IDS = new Set((Deno.env.get("IGNORE_AUTHOR_IDS") ?? "").spli
 async function emit(msg: any) {
   const authorId = msg.user || msg.bot_id || "";
   if (IGNORE_AUTHOR_IDS.has(authorId)) return;
+  // Attachments were invisible before: a message whose whole point is a
+  // screenshot arrived as empty `content`, so the reader had no idea evidence
+  // had been posted at all. Surface enough to know something is there and to go
+  // fetch it deliberately.
+  const files = (msg.files ?? []).map((f: any) => ({
+    name: f.name ?? null,
+    mimetype: f.mimetype ?? null,
+    url_private: f.url_private ?? null,
+  }));
+  const attachments = (msg.attachments ?? []).map((a: any) =>
+    a.title || a.fallback || a.text || ""
+  ).filter(Boolean);
   console.log(JSON.stringify({
     id: msg.ts,
     timestamp: msg.ts,
+    channel_id: CHANNEL ?? null,
     author: msg.user ? await resolveUser(msg.user) : (msg.username || authorId),
     author_id: authorId,
     content: msg.text || "",
     thread_ts: msg.thread_ts ?? null,
+    ...(files.length ? { files } : {}),
+    ...(attachments.length ? { attachments } : {}),
   }));
 }
 
@@ -86,11 +111,23 @@ function argValue(args: string[], flag: string): string | undefined {
 
 async function cmdRead(args: string[]) {
   const limit = Number(argValue(args, "--limit") ?? 100);
-  const oldest = argValue(args, "--oldest");
+  const oldest = argValue(args, "--after") ?? argValue(args, "--oldest");
   const params: Record<string, string | number> = { channel: CHANNEL!, limit };
   if (oldest) params.oldest = oldest;
   const body = await api("conversations.history", params, "GET");
   for (const msg of [...body.messages].reverse()) {
+    if (msg.subtype === "channel_join" || msg.subtype === "channel_leave") continue;
+    await emit(msg);
+  }
+}
+
+async function cmdThread(args: string[]) {
+  if (args.length === 0) {
+    console.error("usage: bridge.ts thread <parent-ts>");
+    Deno.exit(1);
+  }
+  const body = await api("conversations.replies", { channel: CHANNEL!, ts: args[0] }, "GET");
+  for (const msg of body.messages) {
     if (msg.subtype === "channel_join" || msg.subtype === "channel_leave") continue;
     await emit(msg);
   }
@@ -104,7 +141,19 @@ async function cmdSend(args: string[]) {
   const text = args[0];
   const threadTs = argValue(args, "--thread-ts");
   const params: Record<string, string | number> = { channel: CHANNEL!, text };
-  if (threadTs) params.thread_ts = threadTs;
+  if (threadTs) {
+    // chat.postMessage accepts a thread_ts that matches no message and quietly
+    // posts to the channel instead. That turns one mistyped digit into a reply
+    // delivered to the wrong place, with an ok:true response. Check first.
+    try {
+      await api("conversations.replies", { channel: CHANNEL!, ts: threadTs, limit: 1 }, "GET");
+    } catch {
+      console.error(`refusing to send: no message with ts ${threadTs} in ${CHANNEL}. ` +
+        `A wrong --thread-ts would post top-level instead of in the thread.`);
+      Deno.exit(1);
+    }
+    params.thread_ts = threadTs;
+  }
   const body = await api("chat.postMessage", params);
   console.log(JSON.stringify({ ok: true, ts: body.ts, channel: body.channel }));
 }
@@ -119,46 +168,123 @@ async function cmdReact(args: string[]) {
   console.log(JSON.stringify({ ok: true, ts, name }));
 }
 
-// conversations.history omits thread replies entirely — each active thread must be
-// polled separately via conversations.replies, or replies are silently lost.
-async function pollThreads(historyMsgs: any[], threadSeen: Map<string, string>) {
-  for (const parent of historyMsgs) {
-    const replyCount = parent.reply_count || 0;
-    if (replyCount === 0) continue;
-    const parentTs: string = parent.ts;
-    const latestReply: string = parent.latest_reply ?? parentTs;
-    const seen = threadSeen.get(parentTs) ?? parentTs;
-    if (latestReply <= seen) continue;
-    const repliesBody = await api("conversations.replies", { channel: CHANNEL!, ts: parentTs }, "GET");
-    for (const reply of repliesBody.messages) {
-      if (reply.ts === parentTs || reply.ts <= seen) continue;
-      if (reply.subtype === "channel_join" || reply.subtype === "channel_leave") continue;
-      await emit(reply);
+// Slack ts values are "seconds.micro" strings of fixed width, so they order correctly as
+// numbers. Compare numerically anyway, in case a caller passes a shorter form.
+const tsAfter = (a: string, b: string) => Number(a) > Number(b);
+
+const SKIP_SUBTYPES = new Set(["channel_join", "channel_leave"]);
+
+// How many recent top-level messages to scan for threads with new replies. A reply in a
+// thread whose parent is older than this is not seen.
+const THREAD_SCAN_LIMIT = 200;
+
+// Every message (top-level or thread reply) in the channel with ts > `after`, oldest first.
+// conversations.history omits thread replies entirely, so each recent parent whose
+// latest_reply is newer than `after` is fetched with conversations.replies. One ts cursor
+// covers both, because all ts values in a channel share one ordering.
+async function fetchAfter(after: string): Promise<any[]> {
+  const history = await api("conversations.history", { channel: CHANNEL!, limit: THREAD_SCAN_LIMIT }, "GET");
+  const found = new Map<string, any>();
+  for (const msg of history.messages) {
+    if (tsAfter(msg.ts, after)) found.set(msg.ts, msg);
+  }
+  for (const parent of history.messages) {
+    if (!parent.reply_count || !parent.latest_reply || !tsAfter(parent.latest_reply, after)) continue;
+    const replies = await api(
+      "conversations.replies",
+      { channel: CHANNEL!, ts: parent.ts, oldest: after, limit: 200 },
+      "GET",
+    );
+    for (const reply of replies.messages) {
+      if (reply.ts !== parent.ts && tsAfter(reply.ts, after)) found.set(reply.ts, reply);
     }
-    threadSeen.set(parentTs, latestReply);
   }
+  return [...found.values()]
+    .filter((m) => !SKIP_SUBTYPES.has(m.subtype))
+    .sort((a, b) => Number(a.ts) - Number(b.ts));
 }
 
-async function cmdMonitor(args: string[]) {
-  const interval = Number(argValue(args, "--interval") ?? 20);
-  const body0 = await api("conversations.history", { channel: CHANNEL!, limit: 50 }, "GET");
-  let lastTs: string = body0.messages[0]?.ts ?? String(Date.now() / 1000);
-  const threadSeen = new Map<string, string>();
-  for (const m of body0.messages) {
-    if (m.reply_count) threadSeen.set(m.ts, m.latest_reply ?? m.ts);
+// Messages that should not end the wait: bots (including this bridge's own replies) unless
+// --include-bots, and anyone in IGNORE_AUTHOR_IDS.
+function isQuiet(msg: any, includeBots: boolean): boolean {
+  const authorId = msg.user || msg.bot_id || "";
+  if (IGNORE_AUTHOR_IDS.has(authorId)) return true;
+  return !includeBots && (Boolean(msg.bot_id) || msg.subtype === "bot_message");
+}
+
+async function cmdLongPoll(args: string[]) {
+  const after = argValue(args, "--after");
+  if (!after) {
+    console.error(
+      "long-poll: --after <ts> is required. Use the id of the newest message you have seen " +
+        "(the last line of `read`). Without it, a message that arrives before long-poll starts is lost.",
+    );
+    Deno.exit(1);
   }
+  const timeoutRaw = argValue(args, "--timeout");
+  const timeoutSec = timeoutRaw === undefined ? undefined : Number(timeoutRaw);
+  if (timeoutSec !== undefined && (!Number.isFinite(timeoutSec) || timeoutSec <= 0)) {
+    console.error("long-poll: --timeout must be a number of seconds > 0");
+    Deno.exit(1);
+  }
+  const includeBots = args.includes("--include-bots");
+  const intervalSec = Number(Deno.env.get("SLACK_POLL_INTERVAL") ?? "20");
+  const deadline = timeoutSec === undefined ? Infinity : Date.now() + timeoutSec * 1000;
+
+  // The command to run next, with every option of this run except --after. Printed on stdout,
+  // not stderr, because it is an instruction to the agent.
+  const next = (ts: string) =>
+    [
+      "long-poll",
+      `--after ${ts}`,
+      CHANNEL_OVERRIDE !== undefined ? `--channel ${CHANNEL_OVERRIDE}` : "",
+      timeoutRaw !== undefined ? `--timeout ${timeoutRaw}` : "",
+      includeBots ? "--include-bots" : "",
+    ].filter(Boolean).join(" ");
+
+  let cursor = after;
+  console.error(
+    `waiting for messages in channel ${CHANNEL} after ${after} (poll every ${intervalSec}s` +
+      `${timeoutSec === undefined ? "" : `, timeout ${timeoutSec}s`})`,
+  );
+
   while (true) {
-    await new Promise((r) => setTimeout(r, interval * 1000));
-    const body = await api("conversations.history", { channel: CHANNEL!, limit: 50 }, "GET");
-    const msgs = body.messages.filter((m: any) => m.subtype !== "channel_join" && m.subtype !== "channel_leave");
-    const newTopLevel = msgs.filter((m: any) => m.ts > lastTs);
-    for (const msg of [...newTopLevel].reverse()) await emit(msg);
-    await pollThreads(msgs, threadSeen);
-    if (body.messages[0]) lastTs = body.messages[0].ts > lastTs ? body.messages[0].ts : lastTs;
+    // Poll first, sleep after: messages that arrived since `read` come back at once.
+    let batch: any[] = [];
+    try {
+      batch = await fetchAfter(cursor);
+    } catch (e) {
+      // Transient failure (network, rate limit): log and keep polling.
+      console.error(`poll failed: ${e}`);
+    }
+    const found: any[] = [];
+    for (const msg of batch) {
+      cursor = msg.ts; // advance past quiet messages too, or we'd refetch them forever
+      if (!isQuiet(msg, includeBots)) found.push(msg);
+    }
+    if (found.length > 0) {
+      // The reminder goes both before and after the messages: harnesses cut long output at
+      // different ends.
+      console.log(
+        ">>> NEW MESSAGES. Before you act on them, start long-poll again in the background. " +
+          "The command is at the end.",
+      );
+      for (const msg of found) await emit(msg);
+      console.log(`>>> Start this now, in the background, before anything else: ${next(cursor)}`);
+      return;
+    }
+
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      console.log(
+        `>>> No new messages after ${timeoutSec} seconds. Start this now, in the background: ${next(cursor)}`,
+      );
+      return;
+    }
+    await new Promise((r) => setTimeout(r, Math.min(intervalSec * 1000, remaining)));
   }
 }
 
-const [cmd, ...rest] = Deno.args;
 switch (cmd) {
   case "read":
     await cmdRead(rest);
@@ -166,13 +292,24 @@ switch (cmd) {
   case "send":
     await cmdSend(rest);
     break;
+  case "long-poll":
+    await cmdLongPoll(rest);
+    break;
   case "monitor":
-    await cmdMonitor(rest);
+    console.error(
+      "monitor was removed. Use long-poll instead: run `read` and keep the id of the newest " +
+        "message, then run `long-poll --after <id>` as a background command. When it exits, " +
+        "handle what it printed, and run the command on its last >>> line.",
+    );
+    Deno.exit(1);
     break;
   case "react":
     await cmdReact(rest);
     break;
+  case "thread":
+    await cmdThread(rest);
+    break;
   default:
-    console.error("usage: bridge.ts <read|send|monitor|react> ...");
+    console.error("usage: bridge.ts <read|send|long-poll|react|thread> ... [--channel ID]");
     Deno.exit(1);
 }
