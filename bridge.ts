@@ -7,6 +7,7 @@
 //   bridge.ts long-poll --after TS [--timeout SECONDS] [--include-bots]
 //   bridge.ts react <ts> <emoji-name>
 //   bridge.ts thread <parent-ts>
+//   bridge.ts download <url_private> [--out DIR]   (needs --allow-write and the files:read scope)
 // Each message line is one JSON object: {id, timestamp, channel_id, author, author_id, content, thread_ts}.
 // long-poll also prints plain-text lines that start with ">>>": a reminder to start long-poll again
 // before acting on the messages, and the exact command to run next.
@@ -106,7 +107,14 @@ async function emit(msg: any) {
 
 function argValue(args: string[], flag: string): string | undefined {
   const i = args.indexOf(flag);
-  return i >= 0 ? args[i + 1] : undefined;
+  if (i < 0) return undefined;
+  const value = args[i + 1];
+  // A missing value must not swallow the next flag (`--after --timeout 5` would set after="--timeout").
+  if (value === undefined || value.startsWith("--")) {
+    console.error(`${flag} needs a value`);
+    Deno.exit(1);
+  }
+  return value;
 }
 
 async function cmdRead(args: string[]) {
@@ -285,6 +293,31 @@ async function cmdLongPoll(args: string[]) {
   }
 }
 
+// Save a Slack file (the url_private of a message's files[]) so an agent can open it.
+// Slack answers with an HTML login page instead of the file when the token lacks files:read.
+async function cmdDownload(args: string[]) {
+  const url = args.find((a) => !a.startsWith("--"));
+  if (!url) {
+    console.error("usage: bridge.ts download <url_private> [--out DIR]");
+    Deno.exit(1);
+  }
+  const outDir = argValue(args, "--out") ?? HERE + "downloads";
+  const resp = await fetch(url, { headers: { Authorization: `Bearer ${TOKEN}` } });
+  const type = resp.headers.get("content-type") ?? "";
+  if (!resp.ok || type.startsWith("text/html")) {
+    console.error(`download failed: HTTP ${resp.status} ${type} (does the token have files:read?)`);
+    Deno.exit(1);
+  }
+  // files-pri/<TEAM>-<FILE_ID>/<name>: keep the file id so two files with one name do not clash.
+  const parts = new URL(url).pathname.split("/").filter(Boolean);
+  const fileId = (parts.at(-2) ?? "file").split("-").at(-1);
+  const name = decodeURIComponent(parts.at(-1) ?? "file").replace(/[^\w.\-]+/g, "_");
+  await Deno.mkdir(outDir, { recursive: true });
+  const path = `${outDir.replace(/\/$/, "")}/${fileId}-${name}`;
+  await Deno.writeFile(path, new Uint8Array(await resp.arrayBuffer()));
+  console.log(JSON.stringify({ path, content_type: type, bytes: Number(resp.headers.get("content-length") ?? 0) }));
+}
+
 switch (cmd) {
   case "read":
     await cmdRead(rest);
@@ -309,7 +342,10 @@ switch (cmd) {
   case "thread":
     await cmdThread(rest);
     break;
+  case "download":
+    await cmdDownload(rest);
+    break;
   default:
-    console.error("usage: bridge.ts <read|send|long-poll|react|thread> ... [--channel ID]");
+    console.error("usage: bridge.ts <read|send|long-poll|react|thread|download> ... [--channel ID]");
     Deno.exit(1);
 }
