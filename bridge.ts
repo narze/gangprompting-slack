@@ -8,6 +8,14 @@
 //   bridge.ts react <ts> <emoji-name>
 //   bridge.ts thread <parent-ts>
 //   bridge.ts download <url_private> [--out DIR]   (needs --allow-write and the files:read scope)
+//   bridge.ts unreact <ts> <emoji-name>
+//   bridge.ts done <ts>   (swap :eyes: for :white_check_mark:)
+//   bridge.ts upload <file> [--thread-ts TS] [--title T] [--comment TEXT]   (files:write)
+//   bridge.ts status --thread-ts TS "<text>"   (assistant:write; empty text clears it)
+//   bridge.ts edit <ts> "<text>"   (chat.update; only this bot's own messages)
+//   bridge.ts stream-start --thread-ts TS --recipient USER [--team TEAM] [--task T] [--done T] [--text MD] [--text-file F] [--chunks JSON]
+//   bridge.ts stream-append <ts> [same chunk flags]
+//   bridge.ts stream-stop <ts> [same chunk flags]
 // Each message line is one JSON object: {id, timestamp, channel_id, author, author_id, content, thread_ts}.
 // long-poll also prints plain-text lines that start with ">>>": a reminder to start long-poll again
 // before acting on the messages, and the exact command to run next.
@@ -176,6 +184,75 @@ async function cmdReact(args: string[]) {
   console.log(JSON.stringify({ ok: true, ts, name }));
 }
 
+async function cmdUnreact(args: string[]) {
+  if (args.length < 2) {
+    console.error("usage: bridge.ts unreact <ts> <emoji-name>");
+    Deno.exit(1);
+  }
+  const [ts, name] = args;
+  try {
+    await api("reactions.remove", { channel: CHANNEL!, timestamp: ts, name });
+  } catch (e) {
+    if (!String(e).includes("no_reaction")) throw e; // already gone is fine
+  }
+  console.log(JSON.stringify({ ok: true, ts, removed: name }));
+}
+
+// Mark a message as handled: the :eyes: added when work started becomes :white_check_mark:.
+async function cmdDone(args: string[]) {
+  const ts = args[0];
+  if (!ts) {
+    console.error("usage: bridge.ts done <ts>");
+    Deno.exit(1);
+  }
+  await cmdUnreact([ts, "eyes"]);
+  try {
+    await api("reactions.add", { channel: CHANNEL!, timestamp: ts, name: "white_check_mark" });
+  } catch (e) {
+    if (!String(e).includes("already_reacted")) throw e;
+  }
+  console.log(JSON.stringify({ ok: true, ts, name: "white_check_mark" }));
+}
+
+// Upload a local file into the channel (or a thread): getUploadURLExternal, POST the
+// bytes, then completeUploadExternal to share it. Needs the files:write scope.
+async function cmdUpload(args: string[]) {
+  const path = args.find((a, i) => !a.startsWith("--") && !(i > 0 && args[i - 1].startsWith("--")));
+  if (!path) {
+    console.error("usage: bridge.ts upload <file> [--thread-ts TS] [--title T] [--comment TEXT]");
+    Deno.exit(1);
+  }
+  const bytes = await Deno.readFile(path);
+  const filename = path.split("/").pop()!;
+  const { upload_url, file_id } = await api("files.getUploadURLExternal", { filename, length: bytes.length });
+  const up = await fetch(upload_url, { method: "POST", body: bytes });
+  if (!up.ok) throw new Error(`upload failed: HTTP ${up.status}`);
+  const params: Record<string, string> = {
+    files: JSON.stringify([{ id: file_id, title: argValue(args, "--title") ?? filename }]),
+    channel_id: CHANNEL!,
+  };
+  const threadTs = argValue(args, "--thread-ts");
+  const comment = argValue(args, "--comment");
+  if (threadTs) params.thread_ts = threadTs;
+  if (comment) params.initial_comment = comment;
+  const r = await api("files.completeUploadExternal", params);
+  console.log(JSON.stringify({ ok: true, file_id, permalink: r.files?.[0]?.permalink }));
+}
+
+// The "<app> is ..." status line under a thread (assistant.threads.setStatus). Needs
+// assistant:write, which Slack adds when the app is declared an agent. "" clears it;
+// posting a reply also clears it.
+async function cmdStatus(args: string[]) {
+  const threadTs = argValue(args, "--thread-ts");
+  const text = args.find((a, i) => !a.startsWith("--") && !(i > 0 && args[i - 1] === "--thread-ts"));
+  if (!threadTs || text === undefined) {
+    console.error('usage: bridge.ts status --thread-ts TS "<text>"');
+    Deno.exit(1);
+  }
+  await api("assistant.threads.setStatus", { channel_id: CHANNEL!, thread_ts: threadTs, status: text });
+  console.log(JSON.stringify({ ok: true, thread_ts: threadTs, status: text }));
+}
+
 // Slack ts values are "seconds.micro" strings of fixed width, so they order correctly as
 // numbers. Compare numerically anyway, in case a caller passes a shorter form.
 const tsAfter = (a: string, b: string) => Number(a) > Number(b);
@@ -318,6 +395,80 @@ async function cmdDownload(args: string[]) {
   console.log(JSON.stringify({ path, content_type: type, bytes: Number(resp.headers.get("content-length") ?? 0) }));
 }
 
+// Replace the text of a message this bot posted (chat.update, chat:write).
+// Slack rate-limits chat.update at Tier 3 (about 50 a minute).
+async function cmdEdit(args: string[]) {
+  const [ts, text] = args.filter((a) => !a.startsWith("--"));
+  if (!ts || text === undefined) {
+    console.error('usage: bridge.ts edit <ts> "<text>"');
+    Deno.exit(1);
+  }
+  const r = await api("chat.update", { channel: CHANNEL!, ts, text });
+  console.log(JSON.stringify({ ok: true, ts: r.ts }));
+}
+
+// Streaming replies (chat.startStream / appendStream / stopStream, chat:write only).
+// In an ordinary channel a stream must be a thread reply and name its recipient.
+// A stream lives at most 10 minutes; 12,000 characters of text and 50 tasks in total.
+// Every call sends chunks (Slack refuses to mix markdown_text and chunks in one stream),
+// built from these flags in the order given:
+//   --task TITLE   a task shown as in progress
+//   --done TITLE   the same task, now complete
+//   --text MD      markdown text appended to the reply
+//   --text-file F  markdown text read from a file (for long answers)
+//   --chunks JSON  raw chunks, for anything else
+// A task's id is derived from its title, so --done "X" completes the --task "X" from an
+// earlier call.
+const taskId = (title: string) => "t_" + [...title].reduce((h, c) => (h * 31 + c.codePointAt(0)!) >>> 0, 7).toString(36);
+
+async function streamBody(args: string[]): Promise<Record<string, string>> {
+  const chunks: unknown[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const flag = args[i];
+    const value = args[i + 1];
+    if (!["--task", "--done", "--text", "--text-file", "--chunks"].includes(flag)) continue;
+    if (value === undefined) {
+      console.error(`${flag} needs a value`);
+      Deno.exit(1);
+    }
+    i++;
+    if (flag === "--task") chunks.push({ type: "task_update", id: taskId(value), title: value, status: "in_progress" });
+    if (flag === "--done") chunks.push({ type: "task_update", id: taskId(value), title: value, status: "complete" });
+    if (flag === "--text") chunks.push({ type: "markdown_text", text: value });
+    if (flag === "--text-file") chunks.push({ type: "markdown_text", text: await Deno.readTextFile(value) });
+    if (flag === "--chunks") chunks.push(...JSON.parse(value));
+  }
+  return chunks.length > 0 ? { chunks: JSON.stringify(chunks) } : {};
+}
+
+async function cmdStreamStart(args: string[]) {
+  const threadTs = argValue(args, "--thread-ts");
+  const recipient = argValue(args, "--recipient");
+  if (!threadTs || !recipient) {
+    console.error("usage: bridge.ts stream-start --thread-ts TS --recipient USER [--team TEAM] [--task T] [--done T] [--text MD] [--text-file F] [--chunks JSON]");
+    Deno.exit(1);
+  }
+  const team = argValue(args, "--team") ?? Deno.env.get("SLACK_TEAM_ID") ?? (await api("auth.test", {})).team_id;
+  const r = await api("chat.startStream", {
+    channel: CHANNEL!,
+    thread_ts: threadTs,
+    recipient_user_id: recipient,
+    recipient_team_id: team,
+    ...(await streamBody(args)),
+  });
+  console.log(JSON.stringify({ ok: true, ts: r.ts, channel: r.channel }));
+}
+
+async function cmdStreamAppend(args: string[], method: "chat.appendStream" | "chat.stopStream") {
+  const ts = args.find((a, i) => !a.startsWith("--") && !(i > 0 && args[i - 1].startsWith("--")));
+  if (!ts) {
+    console.error(`usage: bridge.ts ${method === "chat.appendStream" ? "stream-append" : "stream-stop"} <ts> [--task T] [--done T] [--text MD] [--text-file F] [--chunks JSON]`);
+    Deno.exit(1);
+  }
+  const r = await api(method, { channel: CHANNEL!, ts, ...(await streamBody(args)) });
+  console.log(JSON.stringify({ ok: true, ts: r.ts ?? ts }));
+}
+
 switch (cmd) {
   case "read":
     await cmdRead(rest);
@@ -345,7 +496,31 @@ switch (cmd) {
   case "download":
     await cmdDownload(rest);
     break;
+  case "unreact":
+    await cmdUnreact(rest);
+    break;
+  case "done":
+    await cmdDone(rest);
+    break;
+  case "upload":
+    await cmdUpload(rest);
+    break;
+  case "status":
+    await cmdStatus(rest);
+    break;
+  case "edit":
+    await cmdEdit(rest);
+    break;
+  case "stream-start":
+    await cmdStreamStart(rest);
+    break;
+  case "stream-append":
+    await cmdStreamAppend(rest, "chat.appendStream");
+    break;
+  case "stream-stop":
+    await cmdStreamAppend(rest, "chat.stopStream");
+    break;
   default:
-    console.error("usage: bridge.ts <read|send|long-poll|react|thread|download> ... [--channel ID]");
+    console.error("usage: bridge.ts <read|send|long-poll|react|thread|download|unreact|done|upload|status|edit|stream-start|stream-append|stream-stop> ... [--channel ID]");
     Deno.exit(1);
 }
