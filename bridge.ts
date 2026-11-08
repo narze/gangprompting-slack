@@ -16,6 +16,7 @@
 //   bridge.ts stream-start --thread-ts TS --recipient USER [--team TEAM] [--task T] [--done T] [--text MD] [--text-file F] [--chunks JSON]
 //   bridge.ts stream-append <ts> [same chunk flags]
 //   bridge.ts stream-stop <ts> [same chunk flags]
+//   bridge.ts card (--spec-file F | --spec JSON) [--thread-ts TS] [--dry-run]   (json-render spec -> Block Kit message)
 // Each message line is one JSON object: {id, timestamp, channel_id, author, author_id, content, thread_ts}.
 // long-poll also prints plain-text lines that start with ">>>": a reminder to start long-poll again
 // before acting on the messages, and the exact command to run next.
@@ -158,20 +159,24 @@ async function cmdSend(args: string[]) {
   const threadTs = argValue(args, "--thread-ts");
   const params: Record<string, string | number> = { channel: CHANNEL!, text };
   if (threadTs) {
-    // chat.postMessage accepts a thread_ts that matches no message and quietly
-    // posts to the channel instead. That turns one mistyped digit into a reply
-    // delivered to the wrong place, with an ok:true response. Check first.
-    try {
-      await api("conversations.replies", { channel: CHANNEL!, ts: threadTs, limit: 1 }, "GET");
-    } catch {
-      console.error(`refusing to send: no message with ts ${threadTs} in ${CHANNEL}. ` +
-        `A wrong --thread-ts would post top-level instead of in the thread.`);
-      Deno.exit(1);
-    }
+    await checkThread(threadTs);
     params.thread_ts = threadTs;
   }
   const body = await api("chat.postMessage", params);
   console.log(JSON.stringify({ ok: true, ts: body.ts, channel: body.channel }));
+}
+
+// chat.postMessage accepts a thread_ts that matches no message and quietly
+// posts to the channel instead. That turns one mistyped digit into a reply
+// delivered to the wrong place, with an ok:true response. Check first.
+async function checkThread(threadTs: string) {
+  try {
+    await api("conversations.replies", { channel: CHANNEL!, ts: threadTs, limit: 1 }, "GET");
+  } catch {
+    console.error(`refusing to send: no message with ts ${threadTs} in ${CHANNEL}. ` +
+      `A wrong --thread-ts would post top-level instead of in the thread.`);
+    Deno.exit(1);
+  }
 }
 
 async function cmdReact(args: string[]) {
@@ -469,6 +474,114 @@ async function cmdStreamAppend(args: string[], method: "chat.appendStream" | "ch
   console.log(JSON.stringify({ ok: true, ts: r.ts ?? ts }));
 }
 
+// Post a json-render spec (skills/slack-card/SKILL.md) as a Block Kit message.
+// @json-render/chat validates the spec and turns it into a Chat SDK card; the Slack
+// adapter's block builder turns the card into blocks plus fallback text for notifications.
+// The libraries load only for this command, so the others keep their permissions and speed.
+// Limits mirror what the block builder would otherwise degrade silently (a second table
+// becomes a code block, a third chart is dropped), so toCard rejects the spec instead.
+const CARD_LIMITS = {
+  tables: 1,
+  charts: 2, // undocumented: Slack rejects a message with more than 2 data_visualization blocks
+  fields: 10,
+  tableRows: 100, // including the header row
+  tableColumns: 20,
+  chartLabel: 20,
+  chartTitle: 50,
+  chartSeries: 12,
+  chartPoints: 20,
+};
+const MAX_BLOCKS = 50;
+
+async function cmdCard(args: string[]) {
+  const specFile = argValue(args, "--spec-file");
+  const specInline = argValue(args, "--spec");
+  const threadTs = argValue(args, "--thread-ts");
+  const dryRun = args.includes("--dry-run");
+  if ((specFile === undefined) === (specInline === undefined)) {
+    console.error("usage: bridge.ts card (--spec-file F | --spec JSON) [--thread-ts TS] [--dry-run]   (--spec-file - reads stdin)");
+    Deno.exit(1);
+  }
+  const raw = specInline ??
+    (specFile === "-" ? await new Response(Deno.stdin.readable).text() : await Deno.readTextFile(specFile!));
+  let spec;
+  try {
+    spec = JSON.parse(raw);
+  } catch (e) {
+    console.error(`card: spec is not valid JSON: ${(e as Error).message}`);
+    Deno.exit(1);
+  }
+
+  const { toCard, CardSpecError } = await import("npm:@json-render/chat@0.22.0");
+  const { cardToSlackBlocks, cardToSlackFallbackText } = await import("npm:@chat-adapter/slack@4.44.0/blocks");
+  let card;
+  try {
+    card = toCard(spec, { limits: CARD_LIMITS });
+  } catch (e) {
+    if (!(e instanceof CardSpecError)) throw e;
+    console.error(`card: invalid spec, ${e.issues.length} issue(s). Fix them and run again:`);
+    for (const issue of e.issues) console.error(`- ${issue}`);
+    Deno.exit(1);
+  }
+  // deno-lint-ignore no-explicit-any
+  const slackCard = card as any; // chat's CardElement and the adapter's SlackCardElement are the same shape
+  // The builder cuts the list at 50 blocks without a word; count first so nothing goes missing.
+  const blocks = cardToSlackBlocks(slackCard, { maxBlocks: Infinity });
+  if (blocks.length > MAX_BLOCKS) {
+    console.error(`card: the spec makes ${blocks.length} blocks; Slack allows ${MAX_BLOCKS} per message. Split it into several cards.`);
+    Deno.exit(1);
+  }
+  const elements: Record<string, { type?: string; children?: string[] }> = spec.elements;
+  if (Object.values(elements).some((el) => el?.type === "Button")) {
+    console.error("card: warning: Button clicks go nowhere (this bridge has no interactivity endpoint). Use LinkButton.");
+  }
+  // toCard drops elements that no parent lists in its children, without a word.
+  const reached = new Set<string>();
+  const walk = (id: string) => {
+    if (reached.has(id)) return;
+    reached.add(id);
+    for (const child of elements[id]?.children ?? []) walk(child);
+  };
+  walk(spec.root);
+  const orphans = Object.keys(elements).filter((id) => !reached.has(id));
+  if (orphans.length > 0) {
+    console.error(`card: warning: not in any children list, so not shown: ${orphans.join(", ")}`);
+  }
+  // Past toCard's checks, the block builder still turns a table or chart Slack would refuse
+  // into a code block (pie value <= 0, duplicate category or series names, a series whose
+  // value count differs from its categories, table text over 10,000 characters). Refuse instead.
+  // Elements with `visible` or `repeat` can render zero or many times, so they stay out of the count.
+  const shown = [...reached].map((id) => elements[id])
+    .filter((el) => el && !("visible" in el) && !("repeat" in el))
+    .map((el) => el.type);
+  const count = (pred: (type?: string) => boolean, list: (string | undefined)[]) => list.filter(pred).length;
+  const blockTypes = blocks.map((b) => (b as { type: string }).type);
+  const fellBack = [
+    count((t) => t === "Table", shown) > count((t) => t === "data_table" || t === "table", blockTypes) ? "Table" : "",
+    count((t) => t === "Chart", shown) > count((t) => t === "data_visualization", blockTypes) ? "Chart" : "",
+  ].filter(Boolean);
+  if (fellBack.length > 0) {
+    console.error(
+      `card: Slack cannot render a ${fellBack.join(" or ")} natively, so it would arrive as a code block. ` +
+        "Check: pie values > 0; categories and series names unique and non-empty; each series has one value per category; table cell text under 10,000 characters.",
+    );
+    Deno.exit(1);
+  }
+  const text = cardToSlackFallbackText(slackCard);
+  if (dryRun) {
+    console.log(JSON.stringify({ text, blocks }, null, 2));
+    return;
+  }
+  const params: Record<string, string> = { channel: CHANNEL!, text, blocks: JSON.stringify(blocks) };
+  if (threadTs) {
+    await checkThread(threadTs);
+    params.thread_ts = threadTs;
+  }
+  const body = await api("chat.postMessage", params);
+  const warnings = body.response_metadata?.warnings;
+  console.log(JSON.stringify({ ok: true, ts: body.ts, channel: body.channel, ...(warnings ? { warnings } : {}) }));
+}
+
 switch (cmd) {
   case "read":
     await cmdRead(rest);
@@ -520,7 +633,10 @@ switch (cmd) {
   case "stream-stop":
     await cmdStreamAppend(rest, "chat.stopStream");
     break;
+  case "card":
+    await cmdCard(rest);
+    break;
   default:
-    console.error("usage: bridge.ts <read|send|long-poll|react|thread|download|unreact|done|upload|status|edit|stream-start|stream-append|stream-stop> ... [--channel ID]");
+    console.error("usage: bridge.ts <read|send|long-poll|react|thread|download|unreact|done|upload|status|edit|stream-start|stream-append|stream-stop|card> ... [--channel ID]");
     Deno.exit(1);
 }

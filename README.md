@@ -32,6 +32,7 @@ mise exec -- deno run --allow-net --allow-env --allow-read bridge.ts status --th
 mise exec -- deno run --allow-net --allow-env --allow-read bridge.ts stream-start --thread-ts TS --recipient USER [chunk flags]
 mise exec -- deno run --allow-net --allow-env --allow-read bridge.ts stream-append <ts> [chunk flags]
 mise exec -- deno run --allow-net --allow-env --allow-read bridge.ts stream-stop <ts> [chunk flags]
+mise exec -- deno run --allow-net --allow-env --allow-read bridge.ts card (--spec-file F | --spec JSON) [--thread-ts TS] [--dry-run]
 ```
 
 Every command also takes `--channel ID` to override `SLACK_CHANNEL` for one call. A flag with no value (for example `--after --timeout 5`) is an error, not a silent mix-up.
@@ -48,6 +49,19 @@ Set `IGNORE_AUTHOR_IDS` (comma-separated Slack user/bot IDs) to skip messages fr
 - `edit <ts> "<text>"` replaces the text of a message the bot posted (`chat.update`, about 50 a minute).
 - `upload <file>` posts a local file to the channel, or to a thread with `--thread-ts` (`files.getUploadURLExternal` + `files.completeUploadExternal`, needs `files:write`).
 - `status --thread-ts TS "<text>"` sets the "<app> is …" line under a thread (`assistant.threads.setStatus`, needs `assistant:write`). An empty text clears it, and so does the bot's next reply.
+
+## Cards
+
+`card` posts a structured message (fields, a native table, up to two native charts, link buttons) from a [json-render](https://json-render.dev) spec. [`@json-render/chat`](https://www.npmjs.com/package/@json-render/chat) validates the spec and the Slack adapter of [Chat SDK](https://www.npmjs.com/package/@chat-adapter/slack) builds the Block Kit blocks and the fallback text for notifications. Both load as pinned `npm:` imports, only when `card` runs; the usual three permission flags are enough, and nothing lands in `node_modules`.
+
+```
+bridge.ts card --spec-file skills/slack-card/examples/status.json --dry-run   # print {text, blocks}, post nothing
+bridge.ts card --spec-file card.json --thread-ts 1700000000.000100           # post; prints {ok, ts, channel}
+```
+
+The spec comes from `--spec-file F` (`-` for stdin) or `--spec '<json>'`. An invalid spec exits 1 with one issue per line on stderr, and so does a spec past Slack's limits (one table, two charts, 50 blocks), instead of posting a degraded message. `Button` renders but its clicks go nowhere, because the bridge has no interactivity endpoint; use `LinkButton`.
+
+[`skills/slack-card/SKILL.md`](skills/slack-card/SKILL.md) is the agent-facing guide: when to use a card, the spec format, every component and the limits, with working examples in `skills/slack-card/examples/`. To make it available to Claude Code, link it into your skills directory: `ln -s "$PWD/skills/slack-card" ~/.claude/skills/slack-card`.
 
 ## Streaming replies
 

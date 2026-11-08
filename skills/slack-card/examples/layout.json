@@ -1,0 +1,43 @@
+{
+  "root": "card",
+  "elements": {
+    "card": {
+      "type": "Card",
+      "props": { "title": "Weekly digest", "subtitle": "Section, Image, bar and area charts", "imageUrl": "https://picsum.photos/seed/digest/600/300" },
+      "children": ["intro", "div", "growth", "orders", "pic", "links"]
+    },
+    "intro": { "type": "Section", "props": {}, "children": ["line1", "line2"] },
+    "line1": { "type": "Text", "props": { "content": "Sign-ups grew every week this month." }, "children": [] },
+    "line2": { "type": "Text", "props": { "content": "Sample data", "style": "muted" }, "children": [] },
+    "div": { "type": "Divider", "props": {}, "children": [] },
+    "growth": {
+      "type": "Chart",
+      "props": {
+        "title": "Active users",
+        "chart": { "type": "area", "categories": ["W1", "W2", "W3", "W4"], "series": [{ "name": "users", "values": [3200, 4100, 3900, 5200] }] }
+      },
+      "children": []
+    },
+    "orders": {
+      "type": "Chart",
+      "props": {
+        "title": "Orders per day",
+        "chart": {
+          "type": "bar",
+          "categories": ["Mon", "Tue", "Wed", "Thu", "Fri"],
+          "series": [
+            { "name": "iOS", "values": [120, 150, 90, 170, 210] },
+            { "name": "Android", "values": [100, 130, 110, 140, 190] }
+          ],
+          "xLabel": "Day",
+          "yLabel": "Orders"
+        }
+      },
+      "children": []
+    },
+    "pic": { "type": "Image", "props": { "url": "https://picsum.photos/seed/chart/600/300", "alt": "Sample image" }, "children": [] },
+    "links": { "type": "Actions", "props": {}, "children": ["docs", "repo"] },
+    "docs": { "type": "LinkButton", "props": { "label": "json-render docs", "url": "https://json-render.dev" }, "children": [] },
+    "repo": { "type": "LinkButton", "props": { "label": "Bridge repo", "url": "https://github.com/narze/gangprompting-slack" }, "children": [] }
+  }
+}
