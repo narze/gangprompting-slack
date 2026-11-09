@@ -1,0 +1,33 @@
+{
+  "root": "card",
+  "elements": {
+    "card": {
+      "type": "Card",
+      "props": { "title": "Release 3.2.1", "subtitle": "Status from the release thread" },
+      "children": ["kpis", "div", "heading", "prs", "links", "note"]
+    },
+    "kpis": { "type": "Fields", "props": {}, "children": ["android", "ios", "backend", "flag"] },
+    "android": { "type": "Field", "props": { "label": "Android", "value": "Approved, 100% rollout" }, "children": [] },
+    "ios": { "type": "Field", "props": { "label": "iOS", "value": "Approved, 100% rollout" }, "children": [] },
+    "backend": { "type": "Field", "props": { "label": "Backend #6912", "value": "Deployed" }, "children": [] },
+    "flag": { "type": "Field", "props": { "label": "Open PRs", "value": 0 }, "children": [] },
+    "div": { "type": "Divider", "props": {}, "children": [] },
+    "heading": { "type": "Text", "props": { "content": "What shipped", "style": "bold" }, "children": [] },
+    "prs": {
+      "type": "Table",
+      "props": {
+        "headers": ["PR", "Change", "Area"],
+        "rows": [
+          ["app#6912", "Facebook Limited Login (iOS)", "Backend"],
+          ["mobile#436", "Fix Google sign-in", "App"],
+          ["mobile#437", "Bump to 3.2.1", "App"]
+        ],
+        "caption": "Merged since 3.2.0"
+      },
+      "children": []
+    },
+    "links": { "type": "Actions", "props": {}, "children": ["open"] },
+    "open": { "type": "LinkButton", "props": { "label": "Open the release PR", "url": "https://github.com/narze/gangprompting-slack" }, "children": [] },
+    "note": { "type": "Text", "props": { "content": "Checked 10 minutes ago", "style": "muted" }, "children": [] }
+  }
+}

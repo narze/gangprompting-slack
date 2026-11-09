@@ -1,0 +1,44 @@
+{
+  "root": "card",
+  "elements": {
+    "card": {
+      "type": "Card",
+      "props": { "title": "API latency, last 24 h", "subtitle": "Sample data" },
+      "children": ["summary", "latency", "share", "src"]
+    },
+    "summary": { "type": "Text", "props": { "content": "p95 peaked at *340 ms* around noon, then recovered." }, "children": [] },
+    "latency": {
+      "type": "Chart",
+      "props": {
+        "title": "Response time (ms)",
+        "chart": {
+          "type": "line",
+          "categories": ["00", "04", "08", "12", "16", "20"],
+          "series": [
+            { "name": "p50", "values": [80, 75, 95, 120, 110, 90] },
+            { "name": "p95", "values": [210, 190, 260, 340, 300, 240] }
+          ],
+          "xLabel": "Hour",
+          "yLabel": "ms"
+        }
+      },
+      "children": []
+    },
+    "share": {
+      "type": "Chart",
+      "props": {
+        "title": "Requests by client",
+        "chart": {
+          "type": "pie",
+          "segments": [
+            { "label": "iOS", "value": 46 },
+            { "label": "Android", "value": 38 },
+            { "label": "Web", "value": 16 }
+          ]
+        }
+      },
+      "children": []
+    },
+    "src": { "type": "Text", "props": { "content": "Source: sample numbers, not real traffic", "style": "muted" }, "children": [] }
+  }
+}
